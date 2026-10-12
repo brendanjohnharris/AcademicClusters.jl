@@ -5,7 +5,7 @@
 
 A Julia package for running distributed work on academic compute clusters. It provides a `ClusterManager` that launches `Distributed.jl` workers, helpers for submitting scripts as batch (and array) jobs, and a scheduler that spreads workers across queues and shared machines according to live free capacity.
 
-There are two site modules: `USydPhysics`, targeting the University of Sydney School of Physics PBS Pro cluster and its shared lab machines, and `NCIGadi`, targeting NCI's Gadi (batch submission only; see below).
+There are two site modules: `USydPhysics`, targeting the University of Sydney School of Physics PBS Pro cluster and its shared lab machines, and `NCIGadi`, targeting NCI's Gadi (batch submission, plus workers inside a running job; see below).
 
 ## Installation
 
@@ -36,21 +36,21 @@ or with the environment variable `ACADEMICCLUSTERS_LOGDIR`. Resolution order is 
 
 ## Usage
 
-The API lives in the site submodules; `AcademicClusters` itself exports nothing.
+The API lives in the site submodules, and nothing is exported; import a submodule and call its functions qualified:
 
 ```julia
-using AcademicClusters.USydPhysics  # or
-using AcademicClusters.NCIGadi
+using Distributed
+using AcademicClusters: USydPhysics  # or NCIGadi
 ```
 
-Note that `USydPhysics.addprocs` is a separate function from `Distributed.addprocs`, not a method of it. Loading both modules unqualified makes the bare name ambiguous and Julia will refuse to resolve it; either use `USydPhysics` alone (as above) and call `Distributed.addprocs` qualified, or import `USydPhysics` qualified and call `USydPhysics.addprocs`.
+`USydPhysics.addprocs` is a separate function from `Distributed.addprocs`, not a method of it, and the qualified name selects which one is called.
 
 ### Interactive workers
 
 `addprocs` submits a PBS job (an array job with one task per worker when `np > 1`) and blocks until the workers connect:
 
 ```julia
-procs = addprocs(4; ncpus = 8, mem = 16, walltime = 24, queue = `taiji`)
+procs = USydPhysics.addprocs(4; ncpus = 8, mem = 16, walltime = 24, queue = `taiji`)
 
 @everywhere f() = myid()
 remotecall_fetch(f, first(procs))
@@ -78,9 +78,9 @@ Workers are given `-t auto` and a heap-size hint of half their requested memory.
 `distributeprocs` probes the cluster and the shared machines for free capacity, then splits `np` workers between them. Cluster workers go through PBS with enforced resource limits; workers on shared machines are launched over ssh with `-t ncpus` threads and a heap hint, but no scheduler enforcement, so they are throttled politely by `saturation`.
 
 ```julia
-procs = distributeprocs(20; ncpus = 2, mem = 8, walltime = 12)
-procs = distributeprocs(10; hpcratio = 0.9)  # bias toward the shared machines
-procs = distributeprocs(Inf; ncpus = 2)      # fill 90% of everything available
+procs = USydPhysics.distributeprocs(20; ncpus = 2, mem = 8, walltime = 12)
+procs = USydPhysics.distributeprocs(10; hpcratio = 0.9)  # bias toward the shared machines
+procs = USydPhysics.distributeprocs(Inf; ncpus = 2)      # fill 90% of everything available
 ```
 
 | Argument | Default | Meaning |
@@ -102,10 +102,10 @@ Capacity is measured per worker shape. For a queue it is the number of `ncpus` b
 `runscript` submits a Julia script or expression as a PBS job and returns `(jobid, logfile)` without waiting:
 
 ```julia
-jobid, logfile = runscript("myscript.jl"; ncpus = 10, mem = 64, walltime = 12)
-jobid, logfile = runscript("myscript.jl"; args = ["input.csv", "out.jld2"])
+jobid, logfile = USydPhysics.runscript("myscript.jl"; ncpus = 10, mem = 64, walltime = 12)
+jobid, logfile = USydPhysics.runscript("myscript.jl"; args = ["input.csv", "out.jld2"])
 
-jobid, logfile = runscript(quote
+jobid, logfile = USydPhysics.runscript(quote
     using MyPackage
     MyPackage.go()
 end)
@@ -117,26 +117,26 @@ An `Expr` is written out one top-level statement per line to a file in the log d
 
 ```julia
 exprs = [:(compute($i)) for i in 1:100]
-jobid = runscripts(exprs; ncpus = 4, mem = 16, walltime = 6)
+jobid = USydPhysics.runscripts(exprs; ncpus = 4, mem = 16, walltime = 6)
 
-jobid = runscripts("/path/to/scripts")  # a directory of 1.jl, 2.jl, ...
+jobid = USydPhysics.runscripts("/path/to/scripts")  # a directory of 1.jl, 2.jl, ...
 ```
 
 For the directory form, only files named `<integer>.jl` are counted, so stray files are ignored; the array is sized to that count.
 
 Defaults for both are `ncpus = 10`, `mem = 31`, `walltime = 48`. `project`, `queue`, `qsubflags`, and `exeflags` are all accepted as `Cmd`s; `project` defaults to the active project's directory (in both `USydPhysics` and `NCIGadi`).
 
-`selfdestruct()` qdels the current job from inside it, for a job that has decided it is done.
+`selfdestruct()` (in both modules) qdels the current job from inside it, for a job that has decided it is done.
 
 ### NCI Gadi
 
-`NCIGadi` provides `runscript` and `runscripts` for NCI's Gadi. Gadi's compute nodes cannot be reached for the `Distributed.jl` handshake, so there is no `addprocs` or `distributeprocs`; batch submission is the whole interface. Jobs are submitted from Gadi itself (a login node), calling `qsub` directly with no ssh hop.
+`NCIGadi` provides `runscript` and `runscripts` for NCI's Gadi. Gadi's compute nodes cannot be reached for the `Distributed.jl` handshake, so there is no `addprocs`, and workers cannot be launched from outside a job. Inside a running multi-node job, `NCIGadi.distributeprocs` launches workers across the allocated nodes over ssh; see its docstring for the one-time key setup. Jobs are submitted from Gadi itself (a login node), calling `qsub` directly with no ssh hop.
 
 ```julia
-using AcademicClusters.NCIGadi
+using AcademicClusters: NCIGadi
 
-jobid, logfile = runscript("myscript.jl"; ncpus = 12, mem = 47, walltime = 24)
-jobs = runscripts([:(compute($i)) for i in 1:100]; ncpus = 1, mem = 4)
+jobid, logfile = NCIGadi.runscript("myscript.jl"; ncpus = 12, mem = 47, walltime = 24)
+jobs = NCIGadi.runscripts([:(compute($i)) for i in 1:100]; ncpus = 1, mem = 4)
 ```
 
 Three settings are read via preferences or environment variables, alongside the shared `logdir`:
@@ -157,9 +157,9 @@ set_preferences!(AcademicClusters, "gadi_project" => "ab12",
 Each is overridable per call with the `project_code`, `storage`, and `queue` keywords. Resource defaults resolve per queue through `gadi_defaults(queue)`, built from the [NCI queue limits](https://opus.nci.org.au/spaces/Help/pages/236881198/Queue+Limits): the GPU queues default to one GPU and its mandated core count (12 cpus per V100 on `gpuvolta`, 16 per A100 on `dgxa100`, 12 per H200 on `gpuhopper`, passed as `-l ngpus`), CPU queues to a quarter node (raised to the queue's minimum request where larger), with memory the proportional node share rounded down so the SU charge follows `ncpus`. Walltime defaults to `gadi_maxwalltime_fraction` (default a quarter) of the queue's small-job cap, floored to whole hours: 12 of 48 hours on `normal`, 6 of 24 on the express queues. Shorter requests backfill sooner and SUs charge actual runtime, not the request, so there is little reason to ask for the cap by default. `jobfs` (node-local scratch) is a flat 10GB: it does not affect the SU charge but does constrain placement, so requesting more than needed only makes jobs harder to schedule; raise it for I/O-heavy work (the PBS default is a stingy 100MB).
 
 ```julia
-gadi_defaults("normal")    # (ncpus = 12, mem = 47, jobfs = 10, ngpus = 0, walltime = 12)
-gadi_defaults("gpuvolta")  # (ncpus = 12, mem = 95, jobfs = 10, ngpus = 1, walltime = 12)
-jobid, logfile = runscript("train.jl"; queue = "gpuvolta")  # 1 GPU, 12 cpus, 95GB
+NCIGadi.gadi_defaults("normal")    # (ncpus = 12, mem = 47, jobfs = 10, ngpus = 0, walltime = 12)
+NCIGadi.gadi_defaults("gpuvolta")  # (ncpus = 12, mem = 95, jobfs = 10, ngpus = 1, walltime = 12)
+jobid, logfile = NCIGadi.runscript("train.jl"; queue = "gpuvolta")  # 1 GPU, 12 cpus, 95GB
 ```
 
 Unknown queues warn and fall back to the `normal` defaults; any of `ncpus`, `mem`, `walltime`, `jobfs`, and `ngpus` can be overridden individually.
@@ -167,16 +167,16 @@ Unknown queues warn and fall back to the `normal` defaults; any of `ncpus`, `mem
 Partial resource requests complete SU-neutrally rather than falling back to the static defaults. The charge is `max(ncpus, mem-share)`, so given only `ncpus` the memory fills to that many cores' proportional share (keeping the charge at `ncpus`), and given only `mem` the cores fill to those the memory share already pays for; a memory request beyond one node rounds `ncpus` up to whole nodes, and on GPU queues the GPU count fills the same way. Explicit values are never altered.
 
 ```julia
-gadi_defaults("normal"; ncpus = 4)   # (ncpus = 4, mem = 15, ...): not the quarter-node 47GB
-gadi_defaults("hugemem"; mem = 300)  # (ncpus = 9, mem = 300, ...): the cores 300GB already pays for
-gadi_defaults("gpuvolta"; mem = 300) # (ncpus = 36, ngpus = 3, ...): the GPUs that memory spans
+NCIGadi.gadi_defaults("normal"; ncpus = 4)   # (ncpus = 4, mem = 15, ...): not the quarter-node 47GB
+NCIGadi.gadi_defaults("hugemem"; mem = 300)  # (ncpus = 9, mem = 300, ...): the cores 300GB already pays for
+NCIGadi.gadi_defaults("gpuvolta"; mem = 300) # (ncpus = 36, ngpus = 3, ...): the GPUs that memory spans
 ```
 
 Expressions interpolate values with `$`, so a parameter sweep is a comprehension; the `setup` keyword prepends a shared block to every expression, holding the activation and `using` boilerplate each job would otherwise repeat:
 
 ```julia
 exprs = [:(main($a, $b)) for (a, b) in Iterators.product(0.1:0.1:1, 1:20)] |> vec
-jobs = runscripts(exprs; setup = quote
+jobs = NCIGadi.runscripts(exprs; setup = quote
     using DrWatson
     @quickactivate :MyPackage
 end)
